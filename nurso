@@ -1,0 +1,67 @@
+# von chat gpt für finnhub api ohne deep research
+import time
+import requests
+import pandas as pd
+from datetime import datetime, timedelta
+
+FINNHUB_API_KEY = "<DEIN_FINNHUB_KEY>"
+BASE = "https://finnhub.io/api/v1/stock/candle"
+
+def unix_ts(dt: datetime) -> int:
+    return int(dt.timestamp())
+
+def fetch_daily_ohlcv(symbol: str, months_back: int = 6, retry_delay: float = 1.0):
+    to_dt = datetime.utcnow().date()
+    from_dt = to_dt - pd.DateOffset(months=months_back)
+    params = {
+        "symbol": symbol,
+        "resolution": "D",
+        "from": unix_ts(pd.to_datetime(from_dt).to_pydatetime()),
+        "to": unix_ts(pd.to_datetime(to_dt).to_pydatetime()),
+        "token": FINNHUB_API_KEY,
+    }
+    for attempt in range(4):
+        r = requests.get(BASE, params=params, timeout=20)
+        if r.status_code == 200:
+            data = r.json()
+            # Finnhub returns {'s': 'ok', 't': [...], 'c': [...], 'o': [...], 'h': [...], 'l': [...], 'v': [...]}
+            if data.get("s") != "ok":
+                return pd.DataFrame()  # z.B. 'no_data'
+            df = pd.DataFrame({
+                "date": pd.to_datetime(data["t"], unit="s"),
+                "open": data["o"],
+                "high": data["h"],
+                "low": data["l"],
+                "close": data["c"],
+                "volume": data["v"],
+            })
+            df["symbol"] = symbol
+            return df
+        elif r.status_code in (429, 503):
+            # Rate limited or temporarily unavailable -> backoff
+            time.sleep(retry_delay * (attempt + 1))
+            continue
+        else:
+            # andere Fehler -> abbrechen / loggen
+            print(f"Error {r.status_code} for {symbol}: {r.text}")
+            return pd.DataFrame()
+    print(f"Failed to fetch {symbol} after retries")
+    return pd.DataFrame()
+
+# Beispiel: mehrere Ticker zusammenführen
+tickers = ["NVDA", "TSLA", "ASML", "META", "AMZN"]  # bei Bedarf ASML.AS prüfen
+all_dfs = []
+for t in tickers:
+    df_t = fetch_daily_ohlcv(t, months_back=6)
+    # kleine Pause zwischen Ticks, um Ratelimits zu schonen
+    time.sleep(0.5)
+    if not df_t.empty:
+        all_dfs.append(df_t)
+
+if all_dfs:
+    df_all = pd.concat(all_dfs, ignore_index=True)
+    # Index und Sortierung
+    df_all = df_all.sort_values(["symbol", "date"]).reset_index(drop=True)
+    print(df_all.head())
+else:
+    print("Keine Daten geladen.")
