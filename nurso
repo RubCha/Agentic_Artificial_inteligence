@@ -1,4 +1,208 @@
 # von chat gpt für finnhub api ohne deep research
+#neu
+# Finnhub: Lade tägliche OHLCV-Daten (letzte 6 Monate) für mehrere Ticker
+# Speichert pro Ticker: CSV und JSON sowie kombinierte Dateien.
+#
+# Anleitung:
+# 1) Setze deine FINNHUB_API_KEY als Environment-Variable oder füge ihn interaktiv ein.
+#    z.B. export FINNHUB_API_KEY="your_key"
+# 2) Starte dieses Script in einer Jupyter-Notebook-Zelle oder als Python-Skript.
+# 3) Die Ausgabedateien werden in /mnt/data/ geschrieben (bei Jupyter-Umgebung) oder
+#    im aktuellen Arbeitsverzeichnis, falls /mnt/data nicht existiert.
+
+import os
+import time
+import json
+import requests
+import pandas as pd
+from datetime import datetime, timezone
+from typing import Optional
+from tqdm import tqdm
+
+# ---------- Konfiguration (anpassen falls nötig) ----------
+TARGET_COMPANIES = [
+    {"name": "NVIDIA", "ticker": "NVDA"},
+    {"name": "Tesla", "ticker": "TSLA"},
+    {"name": "ASML Holdings", "ticker": "ASML"},
+    {"name": "META", "ticker": "META"},
+    {"name": "Amazon", "ticker": "AMZN"},
+]
+
+# Falls für bestimmte Märkte ein Exchange-Suffix nötig ist, passe hier an.
+# Beispiel: ASML an Euronext (wenn erforderlich) -> 'ASML.AS'
+SYMBOL_OVERRIDES = {
+    # 'ASML': 'ASML.AS',
+}
+
+MONTHS_BACK = 6
+OUTPUT_DIR = os.getenv('OUTPUT_DIR', '/mnt/data')
+FINNHUB_API_KEY = os.getenv('FINNHUB_API_KEY') or None
+
+# ---------------------------------------------------------
+
+if not os.path.isdir(OUTPUT_DIR):
+    try:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+    except Exception:
+        # Fallback auf pwd
+        OUTPUT_DIR = os.getcwd()
+
+# Helper: unix timestamp for a datetime.date or datetime
+def to_unix_ts(dt: datetime) -> int:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())
+
+# Berechne from/to Unix für 'months_back' Monate bis heute
+def timeframe_months_back(months_back: int = 6):
+    to_dt = datetime.utcnow().date()
+    # Pandas DateOffset ist praktisch für Monatsberechnung
+    from_dt = (pd.to_datetime(to_dt) - pd.DateOffset(months=months_back)).date()
+    # vom 00:00:00 UTC des from_dt bis 23:59:59 UTC des to_dt
+    from_ts = int(pd.to_datetime(from_dt).replace(tzinfo=timezone.utc).timestamp())
+    to_ts = int(pd.to_datetime(to_dt).replace(tzinfo=timezone.utc).timestamp())
+    return from_ts, to_ts
+
+
+# Robustes Fetch für Finnhub /stock/candle
+def fetch_daily_ohlcv(symbol: str, months_back: int = 6, max_retries: int = 5, pause_between_retries: float = 1.0) -> pd.DataFrame:
+    base_url = "https://finnhub.io/api/v1/stock/candle"
+    from_ts, to_ts = timeframe_months_back(months_back)
+
+    params = {
+        "symbol": symbol,
+        "resolution": "D",
+        "from": from_ts,
+        "to": to_ts,
+        "token": FINNHUB_API_KEY,
+    }
+
+    # Retry-Loop mit exponentiellem Backoff
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.get(base_url, params=params, timeout=20)
+        except Exception as e:
+            print(f"Request error for {symbol} (attempt {attempt}): {e}")
+            time.sleep(pause_between_retries * attempt)
+            continue
+
+        if resp.status_code == 200:
+            data = resp.json()
+            # Finnhub: data['s'] == 'ok' oder 'no_data'
+            if data.get('s') == 'ok':
+                df = pd.DataFrame({
+                    'date': pd.to_datetime(data['t'], unit='s', utc=True),
+                    'open': data.get('o', []),
+                    'high': data.get('h', []),
+                    'low': data.get('l', []),
+                    'close': data.get('c', []),
+                    'volume': data.get('v', []),
+                })
+                return df
+            else:
+                # 'no_data' oder anderes
+                print(f"No data for {symbol} in timeframe (Finnhub response s={data.get('s')}).")
+                return pd.DataFrame()
+
+        elif resp.status_code in (429, 503):
+            # Rate limited / service unavailable -> wait & retry
+            wait = pause_between_retries * attempt
+            print(f"Rate-limited or service unavailable for {symbol} (status {resp.status_code}). Sleeping {wait}s and retrying...")
+            time.sleep(wait)
+            continue
+        else:
+            # andere Fehler -> log und abbrechen
+            try:
+                txt = resp.text[:400]
+            except Exception:
+                txt = '<no response body>'
+            print(f"Error fetching {symbol}: status {resp.status_code} - {txt}")
+            return pd.DataFrame()
+
+    print(f"Failed to fetch {symbol} after {max_retries} attempts.")
+    return pd.DataFrame()
+
+
+# Speichert DataFrame als CSV und JSON (records)
+def save_outputs(df: pd.DataFrame, ticker: str, out_dir: str = OUTPUT_DIR, months_back: int = MONTHS_BACK):
+    if df.empty:
+        print(f"No data to save for {ticker}.")
+        return None
+
+    csv_path = os.path.join(out_dir, f"{ticker}_daily_{months_back}mo.csv")
+    json_path = os.path.join(out_dir, f"{ticker}_daily_{months_back}mo.json")
+
+    # Normalize date to ISO string (naive) for JSON
+    df_to_save = df.copy()
+    df_to_save['date'] = df_to_save['date'].dt.tz_convert('UTC').dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    df_to_save.to_csv(csv_path, index=False)
+
+    # JSON as list of dicts
+    records = df_to_save.to_dict(orient='records')
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+
+    print(f"Saved {len(df_to_save)} rows for {ticker}: {csv_path}, {json_path}")
+    return csv_path, json_path
+
+
+# ---------- Main: Fetch & Save für alle TARGET_COMPANIES ----------
+
+def main():
+    global FINNHUB_API_KEY
+    if not FINNHUB_API_KEY:
+        # Interaktives Fallback (nur, wenn keine Env gesetzt ist)
+        FINNHUB_API_KEY = input('FINNHUB_API_KEY nicht gefunden. Bitte API-Key eingeben (oder ENTER zum Abbrechen): ').strip() or None
+        if not FINNHUB_API_KEY:
+            print('Kein API-Key. Abbruch.')
+            return
+
+    all_dfs = []
+
+    for comp in tqdm(TARGET_COMPANIES, desc='Fetching tickers'):
+        ticker = comp['ticker']
+        symbol = SYMBOL_OVERRIDES.get(ticker, ticker)
+        print(f"\nFetching {comp['name']} ({ticker}) -> symbol used: {symbol}")
+
+        df = fetch_daily_ohlcv(symbol, months_back=MONTHS_BACK)
+        if df.empty:
+            print(f"Kein DataFrame für {ticker}. Überspringe.")
+            continue
+
+        # Markiere symbol/ticker
+        df['symbol'] = ticker
+        all_dfs.append(df)
+
+        # Save per-ticker
+        save_outputs(df, ticker, out_dir=OUTPUT_DIR, months_back=MONTHS_BACK)
+
+        # Kleiner sleep um Rate-Limits zu schonen
+        time.sleep(0.5)
+
+    # Kombiniertes Save
+    if all_dfs:
+        df_all = pd.concat(all_dfs, ignore_index=True)
+        # Sortieren
+        df_all = df_all.sort_values(['symbol', 'date']).reset_index(drop=True)
+        combined_csv = os.path.join(OUTPUT_DIR, f"combined_daily_{MONTHS_BACK}mo.csv")
+        combined_json = os.path.join(OUTPUT_DIR, f"combined_daily_{MONTHS_BACK}mo.json")
+
+        df_all_to_save = df_all.copy()
+        df_all_to_save['date'] = df_all_to_save['date'].dt.tz_convert('UTC').dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+        df_all_to_save.to_csv(combined_csv, index=False)
+        with open(combined_json, 'w', encoding='utf-8') as f:
+            json.dump(df_all_to_save.to_dict(orient='records'), f, ensure_ascii=False, indent=2)
+
+        print(f"\nSaved combined data: {combined_csv}, {combined_json}")
+    else:
+        print('Keine Daten gesamthaft geladen.')
+
+
+if __name__ == '__main__':
+    main()
+
+#alt
 import time
 import requests
 import pandas as pd
