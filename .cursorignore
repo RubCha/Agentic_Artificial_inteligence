@@ -1,6 +1,0 @@
-# Environment variables
-.env
-# Virtual environments
-.venv
-# Logs
-logs/
