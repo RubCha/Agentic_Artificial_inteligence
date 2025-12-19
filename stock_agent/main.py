@@ -1,224 +1,168 @@
-import sys
+#!/usr/bin/env python3
+"""
+main.py - Orchestrator für Aladdin Lite (Terminal-only)
+
+Flow:
+ - Lädt .env
+ - Initialisiert Key-Pools, Fetcher, Analyst, DB
+ - Interaktive CLI: Prompt -> Extrahiere Ticker -> Sammle Daten -> Analysiere -> Speichere -> Report (CSV)
+ - Optional: automatischer Testmodus (--test)
+"""
 import os
+import sys
+import time
+from datetime import datetime
 
-# Fügt den 'src'-Ordner explizit dem Suchpfad hinzu
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+ROOT = os.path.dirname(__file__)
+SRC = os.path.join(ROOT, "src")
+sys.path.insert(0, SRC)
 
-import pandas as pd
-import yfinance as yf
-import ssl
-from datetime import datetime, timedelta
-from typing import List
-
-# DIESE ZWEI ZEILEN SIND KRITISCH, UM DIE .env-DATEI ZU LADEN
 from dotenv import load_dotenv
 load_dotenv()
-# -----------------------------------------------------------
 
-# Importiere die Module
-from src.tools import MarketIntelFetcher
+import logging
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s: %(message)s")
+logger = logging.getLogger("aladdin")
+
+# Lokale Module
+from src.tools import RotatingKeyPool, MarketIntelFetcher, HistoricalTools, DBManager, ReportWriter
 from src.brain import MarketAnalyst
 
-# --- GLOBALER SSL-WORKAROUND (Bleibt für Standard-Libs und yfinance) ---
-try:
-    if hasattr(ssl, '_create_unverified_context'):
-        ssl._create_default_https_context = ssl._create_unverified_context
-    print("ACHTUNG: Globale SSL-Verifizierung für yfinance/Standard-Libs aktiviert.")
-except Exception as e:
-    pass
-# -----------------------------------------------------------------------
+# Konfiguration
+HISTORICAL_PERIOD = os.getenv("HISTORICAL_PERIOD", "6mo")
+THROTTLE_SECONDS = float(os.getenv("THROTTLE_SECONDS", "0.4"))
 
-# --- Konfiguration ---
-HISTORICAL_PERIOD = "6mo"
+# Ensure folders
+os.makedirs(os.path.join(ROOT, "data"), exist_ok=True)
+os.makedirs(os.path.join(ROOT, "reports"), exist_ok=True)
 
-# Optional: Stelle sicher, dass der Datenordner existiert
-if not os.path.exists("data"):
-    os.makedirs("data")
+def run_agent(analyst: MarketAnalyst, fetcher: MarketIntelFetcher, db: DBManager, prompt: str, test_tickers: list = None):
+    logger.info("Prompt erhalten: %s", prompt)
+    tickers = test_tickers or analyst.extract_relevant_tickers(prompt)
+    if not tickers:
+        logger.warning("Keine Ticker extrahiert. Abbruch.")
+        return
 
+    logger.info("Extrahierte Ticker: %s", ", ".join(tickers))
 
-# --- HILFSFUNKTIONEN ---
+    # 1) News & Prices
+    logger.info("Sammle News...")
+    df_news = fetcher.fetch_all_market_news(tickers)
+    time.sleep(THROTTLE_SECONDS)
 
-def _analyze_historical_correlation(ticker: str, df_prices: pd.DataFrame, period: str) -> float:
-    """
-    Analysiert die Korrelation des Tickers mit dem breiteren Markt (SPY).
-    """
-    print(f"-> Analysiere historische Korrelation für {ticker}...")
-    try:
-        # Holen der SPY (S&P 500 ETF) Daten. Sollte nun funktionieren.
-        market_index = yf.download("SPY", period=period, interval="1d")['Adj Close']
+    logger.info("Sammle historische Preise...")
+    df_prices = fetcher.fetch_historical_prices(tickers, period=HISTORICAL_PERIOD)
+    time.sleep(THROTTLE_SECONDS)
 
-        # Überprüfen, ob SPY-Daten erfolgreich abgerufen wurden
-        if market_index.empty:
-            print(f"   Fehler: Konnte SPY-Kursdaten nicht abrufen.")
-            return 0.0
+    if df_prices.empty:
+        logger.error("Keine Kursdaten verfügbar. Abbruch.")
+        return
 
-        ticker_prices = df_prices[ticker]
+    # 2) Sentiment-Analyse
+    logger.info("Analysiere News (Sentiment)...")
+    df_analyzed = analyst.analyze_news_batch(df_news)
+    if not df_analyzed.empty:
+        db.store_sentiments(df_analyzed)
+        analyzed_csv = os.path.join(ROOT, "data", "analyzed_news_latest.csv")
+        df_analyzed.to_csv(analyzed_csv, index=False)
+        logger.info("Analysierte News gespeichert: %s (%d rows)", analyzed_csv, len(df_analyzed))
+    else:
+        logger.info("Keine analysierten News (leer).")
 
-        # Berechnung der täglichen Renditen
-        ticker_returns = ticker_prices.pct_change().dropna()
-        market_returns = market_index.pct_change().dropna()
+    # 3) Pro Ticker: Indikatoren, Fundamentals, Empfehlung, Speicherung
+    results = []
+    for ticker in tickers:
+        t_upper = ticker.upper()
+        if t_upper not in df_prices.columns:
+            logger.warning("Keine Preisdaten für %s – übersprungen.", t_upper)
+            continue
 
-        # Kombinieren und Korrelation berechnen
-        combined = pd.concat([ticker_returns, market_returns], axis=1).dropna()
-        combined.columns = [ticker, 'SPY']
+        prices = df_prices[[t_upper]].dropna()
+        indicators = HistoricalTools.compute_indicators(prices[t_upper])
+        fundamentals = fetcher.fetch_fundamentals(t_upper)
+        correlation = HistoricalTools.compute_correlation_with_spy(df_prices, t_upper, period=HISTORICAL_PERIOD)
 
-        correlation = combined.corr().loc[ticker, 'SPY']
+        news_for_ticker = df_analyzed[df_analyzed['ticker'] == t_upper] if not df_analyzed.empty else df_analyzed
 
-        print(f"   Aktuelle {period} Korrelation {ticker}/SPY: {correlation:.2f}")
-        return correlation
-
-    except Exception as e:
-        print(f"   Fehler bei der Korrelationsanalyse für {ticker}: {e}")
-        return 0.0
-
-
-def _aggregate_current_news(ticker: str, df_news: pd.DataFrame) -> str:
-    """
-    Fasst die relevanten News für den Ticker und das Makroumfeld zusammen.
-    """
-    company_news = df_news[df_news['ticker'] == ticker].sort_values(by='relevance_score', ascending=False).head(5)
-    macro_news = df_news[df_news['ticker'] == 'MACRO'].sort_values(by='relevance_score', ascending=False).head(3)
-
-    summary = f"Wichtigste News für {ticker} (basierend auf {len(company_news)} Artikeln):\n"
-    for _, row in company_news.iterrows():
-        impact = row.get('impact_explanation', 'Keine Begründung verfügbar.')
-        summary += f"- COMPANY: Score {row['relevance_score']}, Sentiment {row['sentiment']}: {row['title']} ({impact})\n"
-
-    summary += f"\nWichtigstes Makro-Umfeld (basierend auf {len(macro_news)} Artikeln):\n"
-    for _, row in macro_news.iterrows():
-        impact = row.get('impact_explanation', 'Keine Begründung verfügbar.')
-        summary += f"- MACRO: Score {row['relevance_score']}, Sentiment {row['sentiment']}: {row['title']} ({impact})\n"
-
-    return summary
-
-
-def _make_final_prediction(analyst: MarketAnalyst, ticker: str, news_summary: str, corr_val: float):
-    """
-    Nutzt Gemini, um alle Informationen zu synthetisieren und eine Vorhersage zu treffen.
-    """
-    corr_info = f"Die historische Korrelation des Tickers {ticker} mit dem S&P 500 über die letzten 6 Monate beträgt {corr_val:.2f}."
-
-    final_prompt = (
-        f"Du bist ein Senior-Portfolio-Manager. Basierend auf den folgenden Daten, gib eine begründete Vorhersage für den Aktienkurs von {ticker} (kurzfristig, 1-5 Tage). "
-        "Deine Antwort MUSS eine klare Vorhersage (Bullish, Bearish, Neutral) und eine ausführliche Begründung (Synthese aus News und Korrelation) enthalten. "
-        "Gehe bei deiner Vorhersage für E-Mobilität auch auf die Frage ein, welches Unternehmen in 5 Jahren Marktführer bleiben wird. "
-        f"\n\n--- Zusammengefasste News ---\n{news_summary}"
-        f"\n\n--- Historische Marktanalyse ---\n{corr_info}"
-        "\n\nDeine finale Analyse und Vorhersage:"
-    )
-
-    try:
-        response = analyst.client.models.generate_content(
-            model="gemini-2.5-pro",
-            contents=final_prompt
+        rec = analyst.make_final_recommendation(
+            ticker=t_upper,
+            prices=prices,
+            indicators=indicators,
+            fundamentals=fundamentals,
+            news_df=news_for_ticker,
+            correlation=correlation
         )
-        print(f"\n\n\n=== FINALE VORHERSAGE FÜR {ticker} ===")
-        print(response.text)
-        print("=======================================")
 
-    except Exception as e:
-        print(f"Fehler bei der finalen Vorhersage für {ticker}: {e}")
+        stop_loss = HistoricalTools.atr_stop_loss(prices[t_upper], multiplier=3)
 
+        db.store_prediction({
+            "timestamp": datetime.utcnow().isoformat(),
+            "ticker": t_upper,
+            "prediction": rec.get("rating", "UNKNOWN"),
+            "pred_price": float(prices[t_upper].iloc[-1]),
+            "stop_loss": stop_loss,
+            "extra": rec
+        })
 
-# --- Haupt-Agenten-Logik (Interaktiv) ---
+        results.append({
+            "ticker": t_upper,
+            "last_price": float(prices[t_upper].iloc[-1]),
+            "recommendation": rec,
+            "stop_loss": stop_loss,
+            "correlation": correlation,
+            "fundamentals": fundamentals,
+            "indicators": indicators
+        })
 
-def run_agent(analyst: MarketAnalyst, user_prompt: str):
-    """
-    Führt den Agenten-Analysezyklus dynamisch aus.
-    """
+        time.sleep(THROTTLE_SECONDS)
 
-    # ------------------------------------------------------------------------
-    # 1. STRATEGIE: Dynamische Ticker-Auswahl (KEIN FALLBACK)
-    # ------------------------------------------------------------------------
+    # 4) Report speichern
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    report_path = os.path.join(ROOT, "reports", f"aladdin_report_{timestamp}.csv")
+    ReportWriter.write_csv(report_path, results)
+    logger.info("Report gespeichert: %s", report_path)
 
-    # a) Versuch, Ticker aus dem Prompt zu extrahieren (Gemini-Client)
-    print(f"\n[Strategist] Analysiere Prompt: '{user_prompt}'")
-    target_tickers = analyst.extract_relevant_tickers(user_prompt)
+    # 5) Optional: Backtest (7 Tage)
+    logger.info("Starte Backtest (7 Tage) – kurze Übersicht:")
+    bt = db.run_backtest(days_forward=7)
+    if bt:
+        logger.info("Backtest-Ergebnisse (letzte 10):")
+        for row in bt[-10:]:
+            logger.info("%s", row)
+    else:
+        logger.info("Keine Backtest-Daten gefunden.")
 
-    if not target_tickers:
-        print("\n[Strategist] Konnte keine relevanten Ticker finden. Analyse abgebrochen.")
-        return
-
-    # 2. DATENBESCHAFFUNG
-    fetcher = MarketIntelFetcher(tickers=target_tickers)
-    print("\n--- 1. BESCHAFFUNG VON ROHDATEN (MarketIntelFetcher) ---")
-
-    df_news = fetcher.fetch_all_market_news()
-    df_prices = fetcher.fetch_historical_prices(period=HISTORICAL_PERIOD)
-
-    # Jetzt prüfen wir die tatsächlichen Ticker, die Daten hatten
-    available_tickers = [t for t in target_tickers if t in df_prices.columns]
-
-    if df_news.empty or not available_tickers:
-        print("\n[Fehler] Datenbeschaffung fehlgeschlagen (entweder News oder Kursdaten fehlen).")
-        return
-
-    # 3. ANALYSE & FILTERUNG
-    print("\n--- 2. ANALYSE UND SENTIMENT-BESTIMMUNG (MarketAnalyst) ---")
-    df_analyzed_news = analyst.analyze_news_batch(df_news)
-
-    if df_analyzed_news.empty:
-        print("\n[Ergebnis] Keine relevanten News nach Sentiment-Analyse übrig.")
-        return
-
-    df_analyzed_news.to_csv("data/analyzed_news_latest.csv", index=False)
-    print("Analysierte News zur Kontrolle in data/analyzed_news_latest.csv gespeichert.")
-
-    # 4. SYNTHESE & ENDAUSGABE
-    print("\n--- 3. SYNTHESE UND VORHERSAGE (Gemini-2.5-Pro) ---")
-
-    # Durchlaufe jeden Ticker für die finale Analyse
-    for ticker in available_tickers:
-        # 4a. Korrelation berechnen
-        corr_val = _analyze_historical_correlation(ticker, df_prices, HISTORICAL_PERIOD)
-
-        # 4b. News zusammenfassen
-        news_summary = _aggregate_current_news(ticker, df_analyzed_news)
-
-        # 4c. Finale Vorhersage durch Gemini-Pro
-        _make_final_prediction(analyst, ticker, news_summary, corr_val)
-
-
-# --- AGENT START (Interaktive Schleife) ---
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Aladdin Lite Terminal")
+    parser.add_argument("--test", action="store_true", help="Starte automatischen Testlauf mit Beispiel-Tickern")
+    args = parser.parse_args()
 
-    print("=========================================================")
-    print("       Aladdin Lite Agent - Interaktiver Marktanalyst     ")
-    print("=========================================================")
-    print("  Beispiel-Prompts: 'Analysiere den KI-Sektor' oder      ")
-    print("  'Finde Unternehmen, die von fallenden Zinsen profitieren'")
-    print("  Gib 'exit' oder 'quit' ein, um das Programm zu beenden.")
-    print("=========================================================")
+    logger.info("Starte Aladdin Lite (Terminal)")
 
-    # Initialisiere MarketAnalyst NUR EINMAL
-    try:
-        analyst = MarketAnalyst()
-    except ValueError as e:
-        print(f"\n--- FEHLER IM AGENTEN-START ---")
-        print(f"BITTE PRÜFEN SIE DIE .ENV-DATEI UND DEN API-SCHLÜSSEL: {e}")
-        sys.exit(1)
+    # Init
+    db = DBManager(os.path.join(ROOT, "data", "aladdin.db"))
+    gem_pool = RotatingKeyPool.from_env("GEMINI_API_KEYS", throttle=THROTTLE_SECONDS)
+    finhub_pool = RotatingKeyPool.from_env("FINNHUB_API_KEYS", throttle=THROTTLE_SECONDS)
+    news_pool = RotatingKeyPool.from_env("NEWS_API_KEYS", throttle=THROTTLE_SECONDS)
 
-    while True:
+    fetcher = MarketIntelFetcher(finnhub_pool=finhub_pool, news_pool=news_pool)
+    analyst = MarketAnalyst(gemini_pool=gem_pool)
+
+    if args.test:
+        logger.info("Starte Testmodus mit Beispiel-Tickern...")
+        test_prompt = "Check Apple, Tesla and Microsoft news and fundamentals"
+        test_tickers = ["AAPL", "TSLA", "MSFT"]
+        run_agent(analyst, fetcher, db, test_prompt, test_tickers=test_tickers)
+    else:
         try:
-            user_prompt = input("\n[Eingabe] Dein Analyse-Wunsch (Prompt): ")
-
-            if user_prompt.lower() in ['exit', 'quit']:
-                print("\nAgent beendet. Auf Wiedersehen!")
-                break
-
-            if not user_prompt:
-                continue
-
-            # Starte den Agenten-Ablauf mit der Analyst-Instanz
-            run_agent(analyst, user_prompt)
-
+            while True:
+                prompt = input("\n[Eingabe] Analyse-Wunsch (oder 'exit'): ").strip()
+                if prompt.lower() in ("exit", "quit"):
+                    logger.info("Beende Aladdin Lite.")
+                    break
+                if not prompt:
+                    continue
+                run_agent(analyst, fetcher, db, prompt)
         except KeyboardInterrupt:
-            print("\nAgent beendet durch Benutzer (Ctrl+C). Auf Wiedersehen!")
-            break
-        except Exception as e:
-            # Ein Fehler in der Schleife soll nicht zum Absturz führen
-            print(f"\nEin kritischer Fehler ist im Hauptprozess aufgetreten: {e}")
-            import traceback
-
-            traceback.print_exc()
-            print("Setze den Agenten für eine neue Eingabe zurück...")
+            logger.info("Benutzerabbruch. Ende.")
