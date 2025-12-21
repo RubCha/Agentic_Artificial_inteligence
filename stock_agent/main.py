@@ -39,38 +39,29 @@ if not os.path.exists("data"):
 # --- HILFSFUNKTIONEN ---
 
 def _analyze_historical_correlation(ticker: str, df_prices: pd.DataFrame, period: str) -> float:
-    """
-    Analysiert die Korrelation des Tickers mit dem breiteren Markt (SPY).
-    """
     print(f"-> Analysiere historische Korrelation für {ticker}...")
     try:
-        # Holen der SPY (S&P 500 ETF) Daten. Sollte nun funktionieren.
-        market_index = yf.download("SPY", period=period, interval="1d")['Adj Close']
-
-        # Überprüfen, ob SPY-Daten erfolgreich abgerufen wurden
-        if market_index.empty:
-            print(f"   Fehler: Konnte SPY-Kursdaten nicht abrufen.")
+        # auto_adjust=True erzwingen und 'Close' statt 'Adj Close' nutzen
+        data = yf.download("SPY", period=period, interval="1d", auto_adjust=True)
+        if data.empty:
             return 0.0
 
+        market_index = data['Close']
         ticker_prices = df_prices[ticker]
 
-        # Berechnung der täglichen Renditen
         ticker_returns = ticker_prices.pct_change().dropna()
         market_returns = market_index.pct_change().dropna()
 
-        # Kombinieren und Korrelation berechnen
         combined = pd.concat([ticker_returns, market_returns], axis=1).dropna()
         combined.columns = [ticker, 'SPY']
 
         correlation = combined.corr().loc[ticker, 'SPY']
-
         print(f"   Aktuelle {period} Korrelation {ticker}/SPY: {correlation:.2f}")
-        return correlation
+        return float(correlation)
 
     except Exception as e:
         print(f"   Fehler bei der Korrelationsanalyse für {ticker}: {e}")
         return 0.0
-
 
 def _aggregate_current_news(ticker: str, df_news: pd.DataFrame) -> str:
     """
@@ -93,26 +84,24 @@ def _aggregate_current_news(ticker: str, df_news: pd.DataFrame) -> str:
 
 
 def _make_final_prediction(analyst: MarketAnalyst, ticker: str, news_summary: str, corr_val: float):
-    """
-    Nutzt Gemini, um alle Informationen zu synthetisieren und eine Vorhersage zu treffen.
-    """
-    corr_info = f"Die historische Korrelation des Tickers {ticker} mit dem S&P 500 über die letzten 6 Monate beträgt {corr_val:.2f}."
+    corr_info = f"Die historische Korrelation von {ticker} mit dem S&P 500 beträgt {corr_val:.2f}."
 
     final_prompt = (
-        f"Du bist ein Senior-Portfolio-Manager. Basierend auf den folgenden Daten, gib eine begründete Vorhersage für den Aktienkurs von {ticker} (kurzfristig, 1-5 Tage). "
-        "Deine Antwort MUSS eine klare Vorhersage (Bullish, Bearish, Neutral) und eine ausführliche Begründung (Synthese aus News und Korrelation) enthalten. "
-        "Gehe bei deiner Vorhersage für E-Mobilität auch auf die Frage ein, welches Unternehmen in 5 Jahren Marktführer bleiben wird. "
-        f"\n\n--- Zusammengefasste News ---\n{news_summary}"
-        f"\n\n--- Historische Marktanalyse ---\n{corr_info}"
-        "\n\nDeine finale Analyse und Vorhersage:"
+        f"Du bist ein Senior-Portfolio-Manager. Basierend auf diesen Daten, gib eine Vorhersage für {ticker} (1-5 Tage).\n"
+        f"Daten:\n{news_summary}\n{corr_info}\n"
+        "Antworte mit einer klaren Vorhersage (Bullish/Bearish/Neutral) und Begründung."
     )
 
     try:
-        response = analyst.client.models.generate_content(
-            model="gemini-2.5-pro",
+        # WICHTIG: Nutze die Rotation auch hier!
+        client = analyst._get_random_client()
+
+        # Hinweis: 'gemini-2.5-flash' ist stabiler als die Pro-Bezeichnung
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
             contents=final_prompt
         )
-        print(f"\n\n\n=== FINALE VORHERSAGE FÜR {ticker} ===")
+        print(f"\n\n=== FINALE VORHERSAGE FÜR {ticker} ===")
         print(response.text)
         print("=======================================")
 
